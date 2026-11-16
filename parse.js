@@ -272,6 +272,37 @@ function tryInlineLink(s, p) {
   return { href, title, end: q + 1 };
 }
 
+// Whether a link label's backticks are balanced per marked's label
+// pattern: a backtick run must either be followed by another run
+// (any length) with no backtick between them (the code-span
+// alternative, which does not require matching run lengths), or sit
+// at the very end of the label (the ``+(?=]) alternative). A lone
+// run with no later run invalidates the label, so no link forms
+// (e.g. `[empty test `a ` b` output](...)` — the third backtick has
+// no partner). Escaped backticks do not count.
+function labelBackticksOk(label) {
+  const n = label.length;
+  let j = 0;
+  while (j < n) {
+    if (label[j] === '\\') { j += 2; continue; }
+    if (label[j] !== '`') { j++; continue; }
+    let e = j;
+    while (e < n && label[e] === '`') e++;
+    // A run at the very end of the label is allowed only when it
+    // has two or more backticks (marked's ``+(?=]) alternative is
+    // `` + `+`, i.e. 2+ backticks); a single trailing backtick
+    // invalidates the label.
+    if (e === n) return e - j >= 2;
+    let k = e;
+    while (k < n && label[k] !== '`') k++;
+    if (k >= n) return false;
+    let m = k;
+    while (m < n && label[m] === '`') m++;
+    j = m;
+  }
+  return true;
+}
+
 // End of a link label starting just after '['. -1 when the label is
 // invalid (contains an unescaped '[') or runs off the end.
 function findLabelEnd(s, p) {
@@ -328,26 +359,34 @@ function isGfmDomain(c) {
 
 // Validate a GFM bare email starting at start; return its end or -1.
 // Local part [A-Za-z0-9.+_-]+, domain labels [A-Za-z0-9_-]+ separated by
-// '.', at least two labels, and the last character must be alphanumeric.
+// '.', at least two labels, and the last label must end in an
+// alphanumeric (marked's domain pattern is [A-Za-z0-9-_]+ followed by
+// one or more '.' + [A-Za-z0-9-_]*[A-Za-z0-9]). A label may end in
+// '_'/'-' only when a '.' follows it directly.
 function scanEmailGfm(s, start) {
   const n = s.length;
   let j = start;
   while (j < n && isGfmLocal(s.charCodeAt(j))) j++;
   if (j === start || s.charCodeAt(j) !== 64) return -1; // '@'
   j++;
-  let labels = 0;
+  const ls0 = j;
+  while (j < n && isGfmDomain(s.charCodeAt(j))) j++;
+  if (j === ls0) return -1;
+  let labels = 1;
   let domainEnd = -1;
-  while (true) {
-    const ls = j;
-    while (j < n && isGfmDomain(s.charCodeAt(j))) j++;
-    if (j === ls) break;
+  while (s.charCodeAt(j) === 46) {
+    let k = j + 1;
+    let lastAlnum = -1;
+    while (k < n && isGfmDomain(s.charCodeAt(k))) {
+      if (isAlnum(s.charCodeAt(k))) lastAlnum = k;
+      k++;
+    }
+    if (lastAlnum < 0) break;
     labels++;
-    domainEnd = j;
-    if (s.charCodeAt(j) === 46) { j++; continue; }
-    break;
+    domainEnd = lastAlnum + 1;
+    j = domainEnd;
   }
   if (labels < 2 || domainEnd < 0) return -1;
-  if (!isAlnum(s.charCodeAt(domainEnd - 1))) return -1;
   return domainEnd;
 }
 
@@ -496,43 +535,44 @@ function parseInlineTag(s, i) {
 
 // Scan a GFM autolink URL starting at i and trim its trailing punctuation,
 // entity-like suffix and unbalanced ')'. Returns the end index.
-function scanGfmUrl(s, i) {
+// Marked's _backpedal for GFM autolinks: the URL is the longest
+// prefix of the scanned candidate segmentable into runs of
+// non-trailing-punctuation, balanced (...) groups, lone &s, and
+// trailing-punctuation runs that are not at the very end (applied
+// until stable, so trailing punctuation is trimmed iteratively).
+const GFM_URL_BACKPEDAL = /(?:[^?!.,:;*_'\"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'\"~)]+(?!$))+/;
+function scanGfmUrl(s, i, bracketActive, defs) {
   const n = s.length;
   let j = i;
   while (j < n) {
     const c = s.charCodeAt(j);
-    if (c === 32 || c === 9 || c === 10 || c === 13 || c === 60 || c === 62) break;
+    // Marked's url pattern stops only at whitespace and '<'; a '>'
+    // is part of the URL.
+    if (c === 32 || c === 9 || c === 10 || c === 13 || c === 60) break;
+    // Inside an active bracket, a ']' that would close the bracket
+    // and start a link destination (or a defined ref label) ends the
+    // URL: the link parser gets priority, as in marked (link is tried
+    // before url). A ']' followed by anything else stays part of the
+    // URL; an inactive bracket cannot form a link, so its ']' does
+    // not end the URL either.
+    if (bracketActive && c === 93) {
+      const nx = s[j + 1];
+      if (nx === '(') break;
+      if (nx === '[') {
+        const cb = s.indexOf(']', j + 2);
+        if (cb > j + 2 && defs && defs.get(normalizeLabel(s.slice(j + 2, cb)))) break;
+      }
+    }
     j++;
   }
-  let end = j;
-  while (end > i) {
-    let changed = false;
-    const tail = s.slice(Math.max(i, end - 40), end);
-    const m = tail.match(/&(?:#\d{1,7};|#[xX][0-9a-fA-F]{1,6};|\w+;)$/);
-    if (m) { end -= m[0].length; changed = true; }
-    if (end > i) {
-      const c = s.charCodeAt(end - 1);
-      if (c === 63 || c === 33 || c === 46 || c === 44 || c === 58 || c === 59 ||
-          c === 42 || c === 95 || c === 126 || c === 39 || c === 34) {
-        end--;
-        changed = true;
-      }
-    }
-    if (end > i && s.charCodeAt(end - 1) === 41) {
-      let open = 0;
-      let close = 0;
-      for (let k = i; k < end; k++) {
-        if (s.charCodeAt(k) === 40) open++;
-        else if (s.charCodeAt(k) === 41) close++;
-      }
-      if (open < close || (end - 2 >= i && s.charCodeAt(end - 2) === 41)) {
-        end--;
-        changed = true;
-      }
-    }
-    if (!changed) break;
-  }
-  return end;
+  let cand = s.slice(i, j);
+  let prev;
+  do {
+    prev = cand;
+    const m = GFM_URL_BACKPEDAL.exec(cand);
+    cand = m ? m[0] : '';
+  } while (cand !== prev);
+  return i + cand.length;
 }
 
 // The character before a www/http/ftp autolink must be the start of the
@@ -603,8 +643,126 @@ function tryGfmEmail(s, atPos, parts, srcs, delims, start) {
     localStart++;
     if (localStart === atPos) return null;
   }
+  // The local part must not absorb a delimiter run that actually
+  // forms emphasis: marked lexes the emphasis first, so the email
+  // starts after such a run (e.g. the `__` in `__because@x.com__`
+  // is the emphasis opener, not part of the address). A `_` run
+  // with no partner (intraword, as in `foo_bar@x.com`, or an
+  // opener whose closer never comes, as in `__foo__bar@x.com`)
+  // stays part of the address. Take the rightmost run the lookback
+  // crossed that has a complementary run (a later run that can
+  // close it, or an earlier emitted run that can open it) and
+  // restart the local part just after it.
+  // Simulate the emphasis scan's m accounting (marked's emStrong):
+  // m starts at the opener's length, opener-only runs add, closers
+  // subtract (rule-of-3 skips are ignored instead). A pair forms
+  // only when some closer brings m to <= 0. A bare "a later run can
+  // close" check over-triggers: an intervening opener-only run
+  // inflates m so the opener never pairs (e.g. `__foo@x.com and
+  // __bar__` — the opener before `foo` never pairs, so the email
+  // includes it).
+  const scanFrom = (opStart, opEnd, opCanClose, limit) => {
+    let m = opEnd - opStart;
+    const y = m;
+    let j = opEnd;
+    while (j < limit) {
+      if (s[j] !== '_') { j++; continue; }
+      let e = j;
+      while (e < s.length && s[e] === '_') e++;
+      const caps = delimCaps('_', s, j, e);
+      const len = e - j;
+      if (!caps[0] && !caps[1]) { j = e; continue; }
+      if (!caps[1]) { m += len; j = e; continue; }
+      const amb = caps[0] && caps[1];
+      if (amb || opCanClose) {
+        if (y % 3 !== 0 && (y + len) % 3 === 0) { j = e; continue; }
+      }
+      m -= len;
+      if (m <= 0) return true;
+      j = e;
+    }
+    return false;
+  };
+  const hasPartner = (runStart, runEnd, canOpen, canClose) => {
+    if (canClose) {
+      // This run is a closer: some earlier emitted opener must pair
+      // with it. Simulate each earlier opener's scan up to this run;
+      // it pairs only if this run brings m to <= 0 (and no earlier
+      // closer already consumed the opener).
+      for (let k = 0; k < delims.length; k++) {
+        const di = delims[k];
+        const p = parts[di];
+        if (p[1] !== '_' || srcs[di] >= runStart) continue;
+        if (!p[3]) continue;
+        let m = p[5];
+        const y = p[5];
+        let j = srcs[di] + p[5];
+        let consumed = false;
+        while (j < runStart) {
+          if (s[j] !== '_') { j++; continue; }
+          let e = j;
+          while (e < s.length && s[e] === '_') e++;
+          const caps = delimCaps('_', s, j, e);
+          const len = e - j;
+          if (!caps[0] && !caps[1]) { j = e; continue; }
+          if (!caps[1]) { m += len; j = e; continue; }
+          const amb = caps[0] && caps[1];
+          if (amb || p[4]) {
+            if (y % 3 !== 0 && (y + len) % 3 === 0) { j = e; continue; }
+          }
+          m -= len;
+          if (m <= 0) { consumed = true; break; }
+          j = e;
+        }
+        if (consumed) continue;
+        const len = runEnd - runStart;
+        const amb = canOpen && canClose;
+        if (amb || p[4]) {
+          if (y % 3 !== 0 && (y + len) % 3 === 0) continue;
+        }
+        if (m - len <= 0) return true;
+      }
+      return false;
+    }
+    if (canOpen) return scanFrom(runStart, runEnd, canClose, s.length);
+    return false;
+  };
+  for (let k = delims.length - 1; k >= 0; k--) {
+    const di = delims[k];
+    const p = parts[di];
+    const ps = srcs[di];
+    if (ps < localStart) break;
+    if (ps >= atPos || p[1] !== '_') continue;
+    if ((!p[3] && !p[4]) || !hasPartner(ps, ps + p[5], p[3], p[4])) continue;
+    localStart = ps + p[5];
+    if (localStart === atPos) return null;
+    break;
+  }
   const emailEnd = scanEmailGfm(s, localStart);
   if (emailEnd < 0) return null;
+  // Marked's email pattern ends with (?![\w-]): a '_' or '-' right
+  // after the domain blocks the email. Exception: a '_' run that is
+  // the closer of an emphasis span containing the email (in marked
+  // the email is lexed inside the span's inner text, where the
+  // closer is absent) still lets the email link.
+  if (emailEnd < s.length) {
+    const c = s.charCodeAt(emailEnd);
+    if (c === 95 || c === 45) {
+      let ok = false;
+      if (c === 95) {
+        let k = emailEnd;
+        while (k < s.length && s[k] === '_') k++;
+        if (delimCaps('_', s, emailEnd, k)[1]) {
+          for (let m = 0; m < delims.length; m++) {
+            const di = delims[m];
+            const p = parts[di];
+            if (p[1] === '_' && srcs[di] < emailEnd && p[3]) { ok = true; break; }
+          }
+        }
+      }
+      if (!ok) return null;
+    }
+  }
   let linkStart = localStart;
   let href = null;
   if (localStart >= 7 && s.slice(localStart - 7, localStart) === 'mailto:') {
@@ -649,87 +807,225 @@ function tryGfmEmail(s, atPos, parts, srcs, delims, start) {
 // [6, text]            code span content
 // [7, html]            raw HTML tag
 // [8]                  hard line break (<br>)
-function processEmphasis(parts, delims, linkSpans) {
+// Emphasis pairing, following marked 18.1.3's emStrong/del scans
+// rather than the CommonMark closer-driven stack: for each opener
+// (left to right) scan forward for its closer, tracking m, the
+// opener's remaining length plus opener-only runs met minus closer
+// runs met, and f, the lengths of ambiguous closers skipped by the
+// rule of 3. A closer pairs only when it brings m to <= 0, using
+// min(b, b + m + f) of its delimiters; the tag is <em> when
+// min(opener, used) is odd, <strong> when even. The inner text is
+// then paired recursively, with the pair's leftover delimiters as
+// the inner range's edges. An opener that finds no closer is
+// retried one delimiter shorter (marked emits the first delimiter
+// as text and re-lexes the rest of the run). Strikethrough scans
+// the same way but only same-length runs (of 1 or 2) pair and there
+// is no rule-of-3 skip.
+function processEmphasis(parts, delims, linkSpans, s, srcs) {
   const opensAt = new Map();
   const closesAt = new Map();
-  const spans = []; // formed [opener part idx, closer part idx]
-  // An emphasis delimiter inside a link's text cannot match one
-  // outside it (and vice versa).
-  const crossesLink = (oi, ci) => {
+  // Innermost link/image span containing a part, or null: a
+  // delimiter pairs only with one in the same span (or none).
+  const ctxOf = (pi) => {
+    let best = null;
     for (let k = 0; k < linkSpans.length; k++) {
-      const s0 = linkSpans[k][0], s1 = linkSpans[k][1];
-      const oiIn = oi > s0 && oi < s1, ciIn = ci > s0 && ci < s1;
-      if (oiIn !== ciIn) return true;
+      const sp = linkSpans[k];
+      if (pi > sp[0] && pi < sp[1] && (!best || sp[1] - sp[0] < best[1] - best[0])) best = sp;
     }
-    return false;
+    return best;
   };
-  // For each delimiter, whether a later delimiter of the same char can
-  // close (i.e. this closer is not the last one of its kind).
-  const hasLaterCloser = new Array(delims.length).fill(false);
-  for (let di = delims.length - 1; di >= 0; di--) {
-    const ch = parts[delims[di]][1];
-    for (let dj = di + 1; dj < delims.length; dj++) {
-      if (parts[delims[dj]][1] === ch && parts[delims[dj]][4]) { hasLaterCloser[di] = true; break; }
+  const ctxCache = new Map();
+  const ctx = (pi) => {
+    if (!ctxCache.has(pi)) ctxCache.set(pi, ctxOf(pi));
+    return ctxCache.get(pi);
+  };
+  // Whether marked's scan applies the rule of 3 to every candidate
+  // closer for this opener: the opener can itself close, is
+  // preceded by a non-space character, and is followed by
+  // punctuation (or, for an asterisk, preceded by a character that
+  // is neither a delimiter nor punctuation).
+  const openerR = (pi) => {
+    const p = parts[pi];
+    const prev = charBefore(s, srcs[pi]);
+    if (prev.trim() === '') return false;
+    const next = charAfter(s, srcs[pi] + p[5]);
+    const h = prev === '*' || prev === '_' || isPunctCh(prev);
+    return isPunctCh(next) || (p[1] === '*' && !h);
+  };
+  // Pairs are recorded outer-first here, but renderParts emits a
+  // part's opens in reverse array order and its closes in array
+  // order, so each new tag goes at the front: the arrays end up
+  // inner-first, which renders as opens outer-first and closes
+  // inner-first.
+  const record = (oi, ci, tag) => {
+    let oa = opensAt.get(oi);
+    if (!oa) { oa = []; opensAt.set(oi, oa); }
+    oa.unshift(tag);
+    let ca = closesAt.get(ci);
+    if (!ca) { ca = []; closesAt.set(ci, ca); }
+    ca.unshift(tag);
+  };
+  // Marked's RDelim first alternative skips one delimiter that
+  // sits between two runs of the other emphasis character, but
+  // only when the pattern starts at the very beginning of the
+  // scan text: for a `*` opener, a `*` run of length 1 between a
+  // `__` run and another `__` run (with no other `*`/`_`
+  // delimiter in between); for a `_` opener, a `_` run of length
+  // 1 between a `**` run and another `**` run. `~` runs do not
+  // break the pattern. Returns the part index to skip, or -1.
+  const chunkSkip = (list, li, ch) => {
+    const other = ch === '*' ? '_' : '*';
+    let stage = 0; // 0: want opening anchor, 1: want the skipped run, 2: want closing anchor
+    for (let k = li + 1; k < list.length; k++) {
+      const cp = list[k];
+      const C = parts[cp];
+      if (C[1] !== ch && C[1] !== other) continue; // '~' and friends are transparent here
+      if (stage === 0) {
+        if (C[1] !== other || C[2] !== 2) return -1;
+        stage = 1;
+      } else if (stage === 1) {
+        if (C[1] !== ch || C[2] !== 1) return -1;
+        stage = 2;
+        // remember the skipped run's part index
+        chunkSkip.found = cp;
+      } else {
+        if (C[1] !== other || C[2] < 2) return -1;
+        return chunkSkip.found;
+      }
     }
-  }
-  for (let di = 0; di < delims.length; di++) {
-    const ci = delims[di];
-    const c = parts[ci];
-    if (!c[4] || c[2] === 0) continue; // cannot close, or used up
-    let passedSpentAmbig = false;
-    let blocked = false;
-    for (let dj = di - 1; dj >= 0; dj--) {
-      const oi = delims[dj];
-      const o = parts[oi];
-      if (o[1] !== c[1]) continue;
-      if (!o[3]) continue;
-      if (o[2] === 0) {
-        // A spent delimiter that could both open and close (it was
-        // used as a closer in an already-formed pair) can block this
-        // closer from matching an earlier opener, but only when this
-        // closer is not the last one of its kind.
-        if (o[4] && hasLaterCloser[di]) {
-          const dLen = o[5], cLen = c[5];
-          if ((dLen + cLen) % 3 === 0 && !(dLen % 3 === 0 && cLen % 3 === 0)) { blocked = true; break; }
-          passedSpentAmbig = true;
+    return -1;
+  };
+  // Pair the delimiters in `list` (part indices, in order). When a
+  // pair forms, its inner range (plus any leftover delimiters of
+  // the pair itself, which belong to the inner text) is paired
+  // first, then scanning resumes after the closer — except that a
+  // leftover closer that can open is itself tried as an opener
+  // afterwards.
+  const processRange = (list) => {
+    for (let li = 0; li < list.length; li++) {
+      const op = list[li];
+      const O = parts[op];
+      if (O[2] <= 0 || !O[3]) continue; // spent, or cannot open
+      const ch = O[1];
+      const oCtx = ctx(op);
+      if (ch === '~') {
+        const need = O[2];
+        if (need > 2) continue; // only runs of 1 or 2 form <del>
+        let p = need;
+        let found = -1;
+        for (let cj = li + 1; cj < list.length; cj++) {
+          const cp = list[cj];
+          const C = parts[cp];
+          if (C[1] !== '~' || C[2] !== need) continue;
+          if (ctx(cp) !== oCtx) continue;
+          if (!C[3] && !C[4]) continue;
+          if (C[3] && !C[4]) { p += C[2]; continue; }
+          p -= C[2];
+          if (p > 0) continue;
+          found = cp;
+          break;
         }
+        if (found < 0) continue;
+        const C = parts[found];
+        const use = Math.min(C[2], C[2] + p);
+        record(op, found, 'del');
+        O[2] -= need;
+        C[2] -= use;
+        const inner = [];
+        for (let k = li + 1; k < list.length && list[k] !== found; k++) inner.push(list[k]);
+        if (inner.length > 0) processRange(inner);
+        li = list.indexOf(found, li);
+        if (C[2] > 0 && C[3]) li--;
         continue;
       }
-      if (passedSpentAmbig && o[5] % 3 !== 0) { blocked = true; break; }
-      // Strikethrough: the two runs must have the same length, and
-      // only lengths 1 and 2 form a <del>.
-      if (c[1] === '~' && (o[2] !== c[2] || o[2] > 2)) continue;
-      // A pair may not straddle an already-formed span: an opener
-      // inside a span that ends before this closer cannot match it.
-      let straddle = false;
-      for (let sp = 0; sp < spans.length; sp++) {
-        const s0 = spans[sp][0], s1 = spans[sp][1];
-        if (s0 < oi && oi < s1 && s1 < ci) { straddle = true; break; }
+      // y is the opener run's length in the current text: it stays
+      // fixed while failed attempts shorten the run by one.
+      // attemptLen is the run length this attempt scans with; the
+      // part's own remaining length O[2] is only reduced when a
+      // pair consumes delimiters (a failed attempt still renders
+      // its first delimiter as literal text, as marked does).
+      const y = O[2];
+      const R = openerR(op);
+      const skipPart = chunkSkip(list, li, ch);
+      let paired = false;
+      let attemptLen = O[2];
+      while (attemptLen > 0 && !paired) {
+        const retry = attemptLen < y;
+        let m = attemptLen;
+        let f = 0;
+        let found = -1;
+        let tagSize = 1;
+        let bUsed = 0;
+        for (let cj = li + 1; cj < list.length; cj++) {
+          const cp = list[cj];
+          if (cp === skipPart) continue; // hidden by the __...*...__ chunk
+          const C = parts[cp];
+          if (C[1] !== ch) continue;
+          if (ctx(cp) !== oCtx) continue;
+          if (C[2] <= 0) continue;
+          const b = C[2];
+          if (!C[3] && !C[4]) continue;
+          if (C[3] && !C[4]) { m += b; continue; } // opener-only
+          // A closer: ambiguous runs, and every run when the opener
+          // can itself close, are skipped by the rule of 3 when the
+          // lengths sum to a multiple of 3 (and the opener's length
+          // is not one). On a retry (the opener was shortened after
+          // a failed attempt) an ambiguous candidate aborts the
+          // scan outright instead.
+          if ((C[3] && C[4]) || R) {
+            if (retry && C[3] && C[4]) break;
+            if (y % 3 !== 0 && (y + b) % 3 === 0) { f += b; continue; }
+          }
+          m -= b;
+          if (m > 0) continue;
+          bUsed = Math.min(b, b + m + f);
+          const minLen = Math.min(attemptLen, bUsed);
+          tagSize = minLen % 2 === 1 ? 1 : 2;
+          found = cp;
+          break;
+        }
+        if (found < 0) { attemptLen--; continue; } // emit one delimiter as text, retry shorter
+        const C = parts[found];
+        const bOrig = C[2];
+        // Of the closer run, (bUsed - tagSize) delimiters belong to
+        // the inner text and (bOrig - bUsed) sit after the pair.
+        const innerLen = bUsed - tagSize;
+        const outerLen = bOrig - bUsed;
+        record(op, found, tagSize === 2 ? 'strong' : 'em');
+        const prefixLen = O[2] - attemptLen; // delimiters emitted as text before the pair
+        O[2] = attemptLen - tagSize; // inner leftover only, for the recursion
+        C[2] = innerLen;
+        const inner = [];
+        if (O[2] > 0) inner.push(op);
+        for (let k = li + 1; k < list.length && list[k] !== found; k++) inner.push(list[k]);
+        if (innerLen > 0) inner.push(found);
+        if (inner.length > 0) processRange(inner);
+        // Restore the opener's literal length: the text-emitted
+        // prefix plus whatever of the inner leftover survived.
+        O[2] = prefixLen + O[2];
+        // Rendered literal length for the closer: whatever of the
+        // inner leftover survived, plus the outer leftover. The
+        // outer leftover is retried as an opener only when nothing
+        // of the inner leftover survives (a single part cannot
+        // carry two runs).
+        const innerRem = C[2];
+        // The inner leftover belongs to this pair's inner text, so
+        // it renders before the pair's close tag (marked's raw span
+        // includes the whole closer run and its inner text is the
+        // span minus the tag delimiters). The outer leftover renders
+        // after the close tag.
+        C[6] = innerRem;
+        C[2] = innerRem + outerLen;
+        li = list.indexOf(found, li);
+        if (outerLen > 0 && innerRem === 0 && C[3]) {
+          C[2] = outerLen;
+          li--;
+        }
+        paired = true;
       }
-      if (straddle) continue;
-      // A delimiter inside a link's text cannot match one outside it.
-      if (crossesLink(oi, ci)) continue;
-      // Odd-match rule (original run lengths): when either delimiter
-      // can both open and close, the sum of the two run lengths must
-      // not be a multiple of 3 unless both lengths are multiples of 3.
-      if ((o[4] || c[3]) && (o[5] + c[5]) % 3 === 0 && !(o[5] % 3 === 0 && c[5] % 3 === 0)) continue;
-      const use = c[1] === '~' ? o[2] : (o[2] >= 2 && c[2] >= 2) ? 2 : 1;
-      const tag = c[1] === '~' ? 'del' : (use === 2 ? 'strong' : 'em');
-      let oa = opensAt.get(oi);
-      if (!oa) { oa = []; opensAt.set(oi, oa); }
-      oa.push(tag);
-      let ca = closesAt.get(ci);
-      if (!ca) { ca = []; closesAt.set(ci, ca); }
-      ca.push(tag);
-      spans.push([oi, ci]);
-      o[2] -= use;
-      c[2] -= use;
-      if (c[2] > 0) di--; // this closer may match again
-      blocked = false;
-      break;
     }
-    if (blocked) continue;
-  }
+  };
+  processRange(delims);
   return { opensAt, closesAt };
 }
 
@@ -737,17 +1033,22 @@ function renderParts(parts, opensAt, closesAt, plain, from, to) {
   let out = '';
   for (let i = from; i < to; i++) {
     const idx = i;
+    const p = parts[idx];
+    // A delimiter part may carry literal characters that belong to
+    // the inner text of a pair it closes (p[6]); those render before
+    // the close tags, the rest after. Plain mode renders all of them.
+    const innerLit = !plain && p[0] === 1 && p[6] ? p[6] : 0;
     if (!plain) {
+      if (innerLit > 0) out += p[1].repeat(innerLit);
       const closes = closesAt.get(idx);
       if (closes) for (let k = 0; k < closes.length; k++) out += '</' + closes[k] + '>';
     }
-    const p = parts[idx];
     switch (p[0]) {
       case 0:
         out += escNoEncode(p[1]);
         break;
       case 1:
-        if (p[2] > 0) out += p[1].repeat(p[2]);
+        if (p[2] - innerLit > 0) out += p[1].repeat(p[2] - innerLit);
         break;
       case 2:
         if (plain) {
@@ -798,6 +1099,7 @@ function inline(s, defs) {
   const delims = [];
   const brackets = [];
   const linkSpans = []; // [opener part idx, closer part idx] of formed links/images
+  const autoInBrackets = []; // autolink opener part indices created inside brackets
   const n = s.length;
   let start = 0;
   let i = 0;
@@ -878,6 +1180,28 @@ function inline(s, defs) {
         k = m;
       }
       if (found >= 0) {
+        // A code span must not swallow the closing ']' of a link
+        // label: marked tries the link first, so if the innermost
+        // active bracket forms a link at its ']', the backticks
+        // stay literal and the ']' handler forms the link.
+        if (brackets.length > 0) {
+          const b = brackets[brackets.length - 1];
+          if (b.active) {
+            const labelEnd = findLabelEnd(s, b.textStart);
+            if (labelEnd > i && labelEnd < found) {
+              const linkText = s.slice(b.textStart, labelEnd);
+              let res = null;
+              // The label must itself be valid (balanced backticks);
+              // otherwise marked does not form the link and the code
+              // span is free to swallow the ']'.
+              if (!linkText.includes('`') || labelBackticksOk(linkText)) {
+                if (s[labelEnd + 1] === '(') res = tryInlineLink(s, labelEnd + 1);
+                if (!res) res = tryRefLink(s, labelEnd + 1, linkText, defs);
+              }
+              if (res) { i = j; continue; }
+            }
+          }
+        }
         let content = s.slice(j, found).replace(/\n/g, ' ');
         if (content.length >= 2 && content[0] === ' ' && content[content.length - 1] === ' ') {
           let allSpaces = true;
@@ -925,6 +1249,13 @@ function inline(s, defs) {
       // later ']').
       if (!b.active) { brackets.pop(); i++; continue; }
       const linkText = s.slice(b.textStart, i);
+      // A label with an unbalanced backtick cannot form a link
+      // (marked's label pattern has no lone-backtick alternative).
+      if (linkText.includes('`') && !labelBackticksOk(linkText)) {
+        brackets.pop();
+        i++;
+        continue;
+      }
       let res = null;
       if (s[i + 1] === '(') res = tryInlineLink(s, i + 1);
       if (!res) res = tryRefLink(s, i + 1, linkText, defs);
@@ -991,7 +1322,7 @@ function inline(s, defs) {
       i++;
       continue;
     }
-    if (ch === '@' && brackets.length === 0) {
+    if (ch === '@') {
       const em = tryGfmEmail(s, i, parts, srcs, delims, start);
       if (em) {
         flushTo(em.linkStart);
@@ -1003,6 +1334,7 @@ function inline(s, defs) {
         parts[linkIdx][4] = parts.length;
         parts.push([3]);
         srcs.push(em.end - 1);
+        if (brackets.length > 0) autoInBrackets.push(linkIdx);
         start = em.end;
         i = em.end;
         continue;
@@ -1011,8 +1343,8 @@ function inline(s, defs) {
       continue;
     }
     if (ch === 'w' && s[i + 1] === 'w' && s[i + 2] === 'w' && s[i + 3] === '.' &&
-        brackets.length === 0 && gfmBoundary(s, i)) {
-      const end = scanGfmUrl(s, i);
+        gfmBoundary(s, i)) {
+      const end = scanGfmUrl(s, i, brackets.length > 0 && brackets[brackets.length - 1].active, defs);
       const fc = s.charCodeAt(i + 4);
       if (end > i + 4 && (isAlnum(fc) || fc === 45)) {
         const href = cleanUrl('http://' + s.slice(i, end));
@@ -1026,6 +1358,7 @@ function inline(s, defs) {
           parts[linkIdx][4] = parts.length;
           parts.push([3]);
           srcs.push(end - 1);
+          if (brackets.length > 0) autoInBrackets.push(linkIdx);
           start = end;
           i = end;
           continue;
@@ -1034,7 +1367,7 @@ function inline(s, defs) {
       i++;
       continue;
     }
-    if ((ch === 'h' || ch === 'H' || ch === 'f' || ch === 'F') && brackets.length === 0) {
+    if (ch === 'h' || ch === 'H' || ch === 'f' || ch === 'F') {
       const c1 = s[i + 1];
       if (c1 === 't' || c1 === 'T') {
         const rest = s.slice(i, i + 8).toLowerCase();
@@ -1045,7 +1378,7 @@ function inline(s, defs) {
         if (schemeLen > 0) {
           // A scheme URL has no boundary check: it links even mid-word
           // (unlike www., which needs a word boundary).
-          const end = scanGfmUrl(s, i);
+          const end = scanGfmUrl(s, i, brackets.length > 0 && brackets[brackets.length - 1].active, defs);
           const fc = s.charCodeAt(i + schemeLen);
           if (end > i + schemeLen && (isAlnum(fc) || fc === 45)) {
             const href = cleanUrl(s.slice(i, end));
@@ -1059,6 +1392,7 @@ function inline(s, defs) {
               parts[linkIdx][4] = parts.length;
               parts.push([3]);
               srcs.push(end - 1);
+              if (brackets.length > 0) autoInBrackets.push(linkIdx);
               start = end;
               i = end;
               continue;
@@ -1072,7 +1406,25 @@ function inline(s, defs) {
     i++;
   }
   flushTo(n);
-  const { opensAt, closesAt } = processEmphasis(parts, delims, linkSpans);
+  // Autolinks (email, www, scheme) created inside brackets are plain
+  // text when they ended up inside a formed link's text: marked lexes
+  // a link's text with inLink set, which suppresses the url tokenizer
+  // (but not the <...> autolink tokenizer, which is why angle
+  // autolinks are not recorded here). The middle text part already
+  // holds the escaped text; the opener/closer become empty text.
+  for (let k = 0; k < autoInBrackets.length; k++) {
+    const li = autoInBrackets[k];
+    for (let m = 0; m < linkSpans.length; m++) {
+      const sp = linkSpans[m];
+      if (li > sp[0] && li < sp[1]) {
+        const closeIdx = parts[li][4];
+        parts[li] = [0, ''];
+        parts[closeIdx] = [0, ''];
+        break;
+      }
+    }
+  }
+  const { opensAt, closesAt } = processEmphasis(parts, delims, linkSpans, s, srcs);
   return renderParts(parts, opensAt, closesAt, false, 0, parts.length);
 }
 // ---------- block-level helpers ----------
@@ -1651,19 +2003,34 @@ function stripIndent(line, n) {
   return line.slice(idx);
 }
 
-function parseFencedCode(lines, i, fence, fenceIndent) {
+function parseFencedCode(lines, i, fence, fenceIndentStr) {
   let text = '';
   let j = i + 1;
   let closed = false;
+  // Marked dedents a fenced block's content by the opening fence's
+  // indent only for backtick fences (its indentCodeCompensation
+  // matches ```, never ~~~): a tilde fence keeps its content's
+  // indent exactly. The dedent is by CHARACTER count (marked's
+  // Dt slices min(leadingWhitespace.length, indent.length) chars
+  // off each content line), not by columns, so a tab counts as one.
+  const strip = fence.ch === '`' ? fenceIndentStr.length : 0;
   while (j < lines.length) {
     const line = lines[j];
     if (fenceCloseInfo(line, fence)) { closed = true; break; }
-    text += stripIndent(line, fenceIndent) + '\n';
+    const m = strip > 0 ? line.match(/^\s+/) : null;
+    text += (m ? line.slice(Math.min(m[0].length, strip)) : line) + '\n';
     j++;
   }
-  // A trailing blank line before the closing fence contributes one
-  // newline less: the content drops a single trailing "\n".
-  if (text.endsWith('\n\n')) text = text.slice(0, -1);
+  // Marked's fences regex captures the content minus the final
+  // newline before the closing fence, and its renderer outputs that
+  // text with a single trailing newline (stripping one and adding
+  // one back), or nothing when it is empty. So one blank line
+  // renders empty, two blank lines render one "\n", three render
+  // two, and so on.
+  if (closed) {
+    let e = text.endsWith('\n') ? text.slice(0, -1) : text;
+    text = e === '' ? '' : (e.endsWith('\n') ? e : e + '\n');
+  }
   return { text, next: closed ? j + 1 : j };
 }
 
@@ -1692,7 +2059,14 @@ function parseHtmlBlock(lines, i, type, endsWithNL) {
     while (j < lines.length && !isBlank(lines[j])) j++;
   }
   let text = lines.slice(i, j).join('\n');
-  const afterBlank = j < lines.length ? isBlank(lines[j]) : !endsWithNL;
+  // Whether the block's trailing newline survives depends on the
+  // next line and the type: marked's types 1-5 end their raw text
+  // at the closing line's newline, which a following whitespace-only
+  // line does not swallow (only a truly empty line does); types 6-7
+  // swallow any blank line after them.
+  const afterBlank = j < lines.length
+    ? (type >= 6 ? isBlank(lines[j]) : lines[j] === '')
+    : !endsWithNL;
   if (!afterBlank || (j >= lines.length && endsWithNL)) text += '\n';
   return { text, next: j };
 }
@@ -1784,7 +2158,20 @@ function buildTable(lines, paraStart, h, d, defs) {
   let k = d + 1;
   while (k < lines.length) {
     const line = lines[k];
-    if (isBlank(line)) break;
+    if (isBlank(line)) {
+      // A whitespace-only line that contains a tab is a table row
+      // of empty cells in marked (its row pattern only excludes a
+      // spaces-only line, and a lone tab is not indented code);
+      // a spaces-only line ends the table.
+      if (line.includes('\t')) {
+        const row = [];
+        for (let m = 0; m < header.length; m++) row.push('');
+        rows.push(row);
+        k++;
+        continue;
+      }
+      break;
+    }
     const ind = indentInfo(line);
     if (ind.cols <= 3) {
       const content = line.slice(ind.idx);
@@ -2014,7 +2401,7 @@ function parseBlocks(lines, defs, endsWithNL, lazyFlags, colBase, inItem) {
     } else {
       const f = fenceInfo(content);
       if (f) {
-        const res = parseFencedCode(lines, i, f, ind.cols);
+        const res = parseFencedCode(lines, i, f, line.slice(0, ind.idx));
         node = { type: 'code', info: f.info, text: res.text };
         i = res.next;
       } else {
