@@ -2413,7 +2413,10 @@ function collectItem(lines, i, marker, defs, endsWithNL, colBase) {
     if (isBlank(line)) {
       // A blank line inside a fenced code block is fence content:
       // it neither ends the item nor counts toward the blank limit.
-      if (st.inFence) {
+      // But only when the fence sits at this level: a fence nested
+      // inside a blockquote (or list) has a container the blank line
+      // lacks, so the blank line is a separator that abandons it.
+      if (st.inFence && st.fenceDepth === 0) {
         sub.push({ line: '', lazy: false });
         blankCount = 0;
         j++;
