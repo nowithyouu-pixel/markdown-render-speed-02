@@ -1913,7 +1913,7 @@ function blockStartContent(content, indentCols) {
 
 // State of the open block while collecting a container's lines.
 function createBlockState() {
-  return { inFence: null, lastIsPara: false, inTable: false, lastLine: null };
+  return { inFence: null, fenceDepth: 0, lastIsPara: false, inTable: false, lastLine: null };
 }
 
 // Strip nested blockquote markers and list markers to find the
@@ -1922,24 +1922,30 @@ function createBlockState() {
 // closes: a closing fence inside a blockquote is written `> ````,
 // and checking the raw line would never match it, leaving inFence
 // stuck so the enclosing list item swallows every following block.
+// Returns {inner, depth}: depth is how many container markers were
+// stripped, so a fence can be told apart from a line at a shallower
+// container level (which abandons, rather than continues, it).
 function stripContainers(line) {
   let inner = line;
+  let depth = 0;
   while (true) {
     const ind2 = indentInfo(inner);
     if (ind2.cols > 3) break;
     const c2 = inner.slice(ind2.idx);
     if (c2.charCodeAt(0) === 62) { // '>'
       inner = stripBq(inner, inner.indexOf('>', ind2.idx));
+      depth++;
       continue;
     }
     const m2 = listMarkerInfo(c2, ind2.cols);
     if (m2 && m2.nonEmpty) {
       inner = c2.slice(m2.contentStart);
+      depth++;
       continue;
     }
     break;
   }
-  return inner;
+  return { inner, depth };
 }
 
 function updateBlockState(st, line) {
@@ -1949,21 +1955,36 @@ function updateBlockState(st, line) {
     return;
   }
   if (st.inFence) {
-    if (fenceCloseInfo(stripContainers(line), st.inFence)) st.inFence = null;
-    st.lastIsPara = false;
-    st.inTable = false;
-    return;
+    const sc = stripContainers(line);
+    // A line at a shallower container depth than the fence was
+    // opened at is outside the fence's container: the fence is
+    // abandoned (it closes with whatever content it had), and this
+    // line is re-processed as an ordinary line.
+    if (sc.depth < st.fenceDepth) {
+      st.inFence = null;
+      st.fenceDepth = 0;
+    } else {
+      if (fenceCloseInfo(sc.inner, st.inFence)) {
+        st.inFence = null;
+        st.fenceDepth = 0;
+      }
+      st.lastIsPara = false;
+      st.inTable = false;
+      return;
+    }
   }
   // Strip nested blockquote markers and list markers to find the
   // innermost content; the open block a lazy line could continue is
   // the innermost one.
-  line = stripContainers(line);
+  const sc = stripContainers(line);
+  line = sc.inner;
   const ind = indentInfo(line);
   if (ind.cols >= 4) return; // paragraph continuation, or indented code
   const content = line.slice(ind.idx);
   const f = fenceInfo(content);
   if (f) {
     st.inFence = f;
+    st.fenceDepth = sc.depth;
     st.lastIsPara = false;
     st.inTable = false;
     st.lastLine = line;
@@ -2412,10 +2433,12 @@ function collectItem(lines, i, marker, defs, endsWithNL, colBase) {
     // Inside a fenced code block, a less-indented line belongs to
     // the item only once the fence is established (see above). A
     // less-indented first content line ends the item, leaving the
-    // fence empty inside it. Strip only leading whitespace, never
-    // content characters.
+    // fence empty inside it. A list marker never is fence content:
+    // it ends the item (a sibling item or a new list). Strip only
+    // leading whitespace, never content characters.
     if (st.inFence) {
       if (!fenceEstablished) break;
+      if (listMarkerInfo(line.slice(ind.idx), ind.cols)) break;
       const subLine = stripIndent(line, marker.contentIndent);
       sub.push({ line: subLine, lazy: false });
       updateBlockState(st, subLine);
