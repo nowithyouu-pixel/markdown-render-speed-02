@@ -2345,6 +2345,10 @@ function collectItem(lines, i, marker, defs, endsWithNL, colBase) {
   const sub = [];
   const st = createBlockState();
   let itemLoose = false;
+  // True once a fenced code block opened in this item has had a
+  // content line indented to the item's content indent. Until then,
+  // a less-indented line ends the item instead of joining the fence.
+  let fenceEstablished = false;
   let j = i;
   const firstLine = stripColsTab(lines[i], marker.contentIndent, colBase || 0);
   sub.push({ line: firstLine, lazy: false });
@@ -2391,20 +2395,31 @@ function collectItem(lines, i, marker, defs, endsWithNL, colBase) {
     }
     const ind = indentInfo(line);
     if (ind.cols >= marker.contentIndent) {
+      const wasInFence = st.inFence;
       const subLine = stripColsTab(line, marker.contentIndent, colBase || 0);
       sub.push({ line: subLine, lazy: false });
       updateBlockState(st, subLine);
+      // A fence content line indented to the item's content indent
+      // establishes the fence in the item; later lines of any indent
+      // are then fence content. The opening fence line itself does
+      // not establish it, and a closing fence resets it.
+      if (wasInFence && st.inFence) fenceEstablished = true;
+      if (!st.inFence) fenceEstablished = false;
       blankCount = 0;
       j++;
       continue;
     }
-    // Inside a fenced code block, a line belongs to the item no
-    // matter its indent (fence content is literal). Strip only
-    // leading whitespace, never content characters.
+    // Inside a fenced code block, a less-indented line belongs to
+    // the item only once the fence is established (see above). A
+    // less-indented first content line ends the item, leaving the
+    // fence empty inside it. Strip only leading whitespace, never
+    // content characters.
     if (st.inFence) {
+      if (!fenceEstablished) break;
       const subLine = stripIndent(line, marker.contentIndent);
       sub.push({ line: subLine, lazy: false });
       updateBlockState(st, subLine);
+      if (!st.inFence) fenceEstablished = false;
       blankCount = 0;
       j++;
       continue;
