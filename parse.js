@@ -1299,8 +1299,14 @@ function inline(s, defs) {
       }
       const tagEnd = parseInlineTag(s, i);
       if (tagEnd > 0) {
+        const tagText = s.slice(i, tagEnd);
+        // A start `<a ...>` tag sets the document inLink state and a
+        // `</a>` tag clears it (marked's startATag is /^<a /i — a
+        // bare `<a>` does not count — and endATag is /^<\/a>/i).
+        if (/^<a /i.test(tagText)) docInLink = true;
+        else if (/^<\/a>/i.test(tagText)) docInLink = false;
         flushTo(i);
-        parts.push([7, s.slice(i, tagEnd)]);
+        parts.push([7, tagText]);
         srcs.push(i);
         i = tagEnd;
         start = tagEnd;
@@ -1323,7 +1329,9 @@ function inline(s, defs) {
       continue;
     }
     if (ch === '@') {
-      const em = tryGfmEmail(s, i, parts, srcs, delims, start);
+      // Bare-email autolinks are suppressed while inside an <a> tag
+      // (the document-level inLink state).
+      const em = docInLink ? null : tryGfmEmail(s, i, parts, srcs, delims, start);
       if (em) {
         flushTo(em.linkStart);
         const linkIdx = parts.length;
@@ -1343,7 +1351,7 @@ function inline(s, defs) {
       continue;
     }
     if (ch === 'w' && s[i + 1] === 'w' && s[i + 2] === 'w' && s[i + 3] === '.' &&
-        gfmBoundary(s, i)) {
+        gfmBoundary(s, i) && !docInLink) {
       const end = scanGfmUrl(s, i, brackets.length > 0 && brackets[brackets.length - 1].active, defs);
       const fc = s.charCodeAt(i + 4);
       if (end > i + 4 && (isAlnum(fc) || fc === 45)) {
@@ -1375,7 +1383,7 @@ function inline(s, defs) {
         if (rest.startsWith('http://')) schemeLen = 7;
         else if (rest.startsWith('https://')) schemeLen = 8;
         else if (rest.startsWith('ftp://')) schemeLen = 6;
-        if (schemeLen > 0) {
+        if (schemeLen > 0 && !docInLink) {
           // A scheme URL has no boundary check: it links even mid-word
           // (unlike www., which needs a word boundary).
           const end = scanGfmUrl(s, i, brackets.length > 0 && brackets[brackets.length - 1].active, defs);
@@ -2549,7 +2557,17 @@ function renderItem(it, list, defs) {
 
 // ---------- entry point ----------
 
+// Whether the inline lexer is currently inside an <a> tag: marked
+// sets this when it lexes a start `<a ...>` tag and clears it on
+// `</a>`, and the state persists across paragraphs for the whole
+// document, suppressing bare-URL/email autolinks (but not <...>
+// autolinks). Only inline tags count — an <a> in an HTML block is
+// never lexed inline, so it does not set the state. Reset per
+// document in parse().
+let docInLink = false;
+
 export function parse(markdown) {
+  docInLink = false;
   const src = markdown.replace(/\r\n?/g, '\n');
   const endsWithNL = src.endsWith('\n');
   const lines = src.split('\n');
