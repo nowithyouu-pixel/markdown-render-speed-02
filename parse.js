@@ -574,6 +574,24 @@ function parseInlineTag(s, i) {
 // trailing-punctuation runs that are not at the very end (applied
 // until stable, so trailing punctuation is trimmed iteratively).
 const GFM_URL_BACKPEDAL = /(?:[^?!.,:;*_'\"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'\"~)]+(?!$))+/;
+// Marked's emStrong mask (#n), gfm rules: anyPunctuationOutsideCode
+// normalises backticks inside code spans to '+' (length-preserving),
+// then blockSkip hides links, code spans and HTML tags. blockSkip's
+// code-span alternative can span a link label's backticks to a later
+// code span's backticks, hiding everything between (including
+// emphasis delimiters) from the emphasis scan.
+const EM_MASK_PUNCT = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
+const EM_MASK_SKIP = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\)]|\((?:\\[\s\S]|[^\\)])*\))*\)|(?<!`)(?<b>`+)[^`]+\k<b>(?!`)|<(?! )[^<>]*?>/g;
+// Spans [start, end] of the paragraph text that marked's emStrong
+// mask hides (positions are in the original text: the normalisation
+// step preserves length).
+function emStrongMaskSpans(s) {
+  const t2 = s.replace(EM_MASK_PUNCT, (n, g1, g2) => g2 ? '+'.repeat(n.length) : g1 ? g1 + n.slice(g1.length, -g1.length).replace(/`/g, '+') + g1 : n);
+  const spans = [];
+  EM_MASK_SKIP.lastIndex = 0;
+  for (const m of t2.matchAll(EM_MASK_SKIP)) spans.push([m.index, m.index + m[0].length]);
+  return spans;
+}
 function scanGfmUrl(s, i, bracketActive, defs) {
   const n = s.length;
   let j = i;
@@ -1058,6 +1076,20 @@ function processEmphasis(parts, delims, linkSpans, s, srcs) {
       }
     }
   };
+  // Drop delimiter runs hidden by marked's emStrong mask, unless
+  // they sit inside a formed link's text (marked scans emphasis
+  // there separately, on the link text, so they can still pair).
+  const maskSpans = emStrongMaskSpans(s);
+  if (maskSpans.length > 0) {
+    delims = delims.filter(di => {
+      const ps = srcs[di];
+      for (let k = 0; k < maskSpans.length; k++) {
+        const sp = maskSpans[k];
+        if (ps >= sp[0] && ps < sp[1] && !ctx(di)) return false;
+      }
+      return true;
+    });
+  }
   processRange(delims);
   return { opensAt, closesAt };
 }
