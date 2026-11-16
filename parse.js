@@ -303,6 +303,39 @@ function labelBackticksOk(label) {
   return true;
 }
 
+// Replace backticks that sit inside a code span's content with '+',
+// mirroring marked's emStrong mask (anyPunctuationOutsideCode): a
+// code span's inner backticks are masked, so a label that fails the
+// link pattern only because of an inner backtick still matches the
+// mask's link pattern, hiding its delimiters from the emphasis scan.
+function maskLabelBackticks(label) {
+  const n = label.length;
+  let out = '';
+  let j = 0;
+  while (j < n) {
+    if (label[j] !== '`') { out += label[j]; j++; continue; }
+    let e = j;
+    while (e < n && label[e] === '`') e++;
+    const runLen = e - j;
+    let k = e;
+    let found = -1;
+    while (k < n) {
+      const bt = label.indexOf('`', k);
+      if (bt < 0) break;
+      let m = bt;
+      while (m < n && label[m] === '`') m++;
+      if (m - bt === runLen) { found = bt; break; }
+      k = m;
+    }
+    if (found < 0) { out += label.slice(j, e); j = e; continue; }
+    out += label.slice(j, e);
+    for (let q = e; q < found; q++) out += label[q] === '`' ? '+' : label[q];
+    out += label.slice(found, found + runLen);
+    j = found + runLen;
+  }
+  return out;
+}
+
 // End of a link label starting just after '['. -1 when the label is
 // invalid (contains an unescaped '[') or runs off the end.
 function findLabelEnd(s, p) {
@@ -1252,6 +1285,25 @@ function inline(s, defs) {
       // A label with an unbalanced backtick cannot form a link
       // (marked's label pattern has no lone-backtick alternative).
       if (linkText.includes('`') && !labelBackticksOk(linkText)) {
+        // The link does not form, but if the label would match after
+        // the punct-mask (its code spans' inner backticks replaced),
+        // marked's emStrong mask still matches the whole `[...](...)`
+        // span and hides the label's delimiters, so they must not
+        // pair (e.g. `[at _node `` a ` b ``_](x)` — the `_` around
+        // the code span stays literal).
+        // Only when the '(' after ']' actually opens a valid
+        // destination (so the mask's link pattern matches the span);
+        // without a closing ')' the mask does not hide anything.
+        if (!b.image && s[i + 1] === '(' && tryInlineLink(s, i + 1) &&
+            labelBackticksOk(maskLabelBackticks(linkText))) {
+          for (let k = 0; k < delims.length; k++) {
+            const di = delims[k];
+            if (srcs[di] >= b.textStart && srcs[di] < i) {
+              parts[di][3] = false;
+              parts[di][4] = false;
+            }
+          }
+        }
         brackets.pop();
         i++;
         continue;
